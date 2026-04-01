@@ -1,12 +1,20 @@
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
 }
 
 model Book {
-  id       String   @id @default(cuid())
-  title    String
-  author   String
+  id        Int      @id @default(autoincrement())
+  title     String
+  author    String
+  isbn      String?
+  status    String   @default("TO_READ") // TO_READ, READING, COMPLETED
+  rating    Int?
+  notes     String?
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
