@@ -3,91 +3,78 @@ import { z } from 'zod';
 import { prisma } from '../utils/prisma';
 import { TRPCClientError } from '@trpc/client';
 import { inferProcedureOutput } from '@trpc/server';
+import { AppRouter } from '../pages/api/trpc/book/router';
 
-interface CacheConfig {
-  ttl: number; // time to live in seconds
+// Define cache interface
+interface Cache {
+  get: (key: string) => any;
+  set: (key: string, value: any, ttl: number) => void;
+  delete: (key: string) => void;
 }
 
-interface CacheEntry<T> {
-  data: T;
-  expiresAt: number;
-}
+// Create a simple in-memory cache with TTL
+class CacheImpl implements Cache {
+  private cache: { [key: string]: { value: any; expires: number } };
 
-class Cache<T> {
-  private cache: Record<string, CacheEntry<T>> = {};
-  private config: CacheConfig;
-
-  constructor(config: CacheConfig) {
-    this.config = config;
+  constructor() {
+    this.cache = {};
   }
 
-  async get(key: string): Promise<T | null> {
-    const cacheEntry = this.cache[key];
-    if (!cacheEntry) return null;
-    if (cacheEntry.expiresAt < Date.now()) {
+  get(key: string): any {
+    const cached = this.cache[key];
+    if (!cached || cached.expires < Date.now()) {
       delete this.cache[key];
       return null;
     }
-    return cacheEntry.data;
+    return cached.value;
   }
 
-  async set(key: string, data: T): Promise<void> {
-    const expiresAt = Date.now() + this.config.ttl * 1000;
-    this.cache[key] = { data, expiresAt };
+  set(key: string, value: any, ttl: number): void {
+    this.cache[key] = { value, expires: Date.now() + ttl };
   }
 
-  async invalidate(key: string): Promise<void> {
+  delete(key: string): void {
     delete this.cache[key];
   }
 }
 
-const cacheConfig: CacheConfig = {
-  ttl: 60, // 1 minute
-};
+// Create a cache instance
+const cache = new CacheImpl();
 
-const cache = new Cache(cacheConfig);
-
-export const getCache = async <T>(key: string): Promise<T | null> => {
-  return await cache.get(key);
-};
-
-export const setCache = async <T>(key: string, data: T): Promise<void> => {
-  await cache.set(key, data);
-};
-
-export const invalidateCache = async (key: string): Promise<void> => {
-  await cache.invalidate(key);
-};
-
-// Example usage:
-// const cachedData = await getCache('books');
-// if (!cachedData) {
-//   const data = await prisma.book.findMany();
-//   await setCache('books', data);
-// }
-
-// Invalidate cache when data changes
-// await invalidateCache('books');
-
-// Use with tRPC
-export const withCache = async <T>(
-  input: z.ZodObject<any>,
-  procedure: (input: z.infer<typeof input>) => Promise<inferProcedureOutput<T>>,
-): Promise<inferProcedureOutput<T>> => {
-  const cacheKey = JSON.stringify(input);
-  const cachedData = await getCache(cacheKey);
-  if (cachedData) {
-    return cachedData;
+// Define a function to cache API responses
+async function cacheResponse<T extends keyof AppRouter['_def']['queries']>(
+  procedure: T,
+  input: z.input<AppRouter['_def']['queries'][T]['input']>,
+  ttl: number = 60 * 1000 // 1 minute
+): Promise<inferProcedureOutput<AppRouter['_def']['queries'][T]>> {
+  const key = `${procedure}_${JSON.stringify(input)}`;
+  const cached = cache.get(key);
+  if (cached) {
+    return cached;
   }
+
   try {
-    const data = await procedure(input.parse(input));
-    await setCache(cacheKey, data);
-    return data;
+    const response = await prisma.$queryRaw(
+      `SELECT * FROM ${procedure}(${JSON.stringify(input)})`
+    );
+    cache.set(key, response, ttl);
+    return response;
   } catch (error) {
-    if (error instanceof TRPCClientError) {
-      throw error;
-    }
-    console.error(error);
-    throw error;
+    throw new TRPCClientError({
+      message: 'Failed to fetch data',
+      code: 'INTERNAL_SERVER_ERROR',
+    });
   }
-};
+}
+
+// Define a function to invalidate cache for a specific procedure
+function invalidateCache(procedure: keyof AppRouter['_def']['queries']): void {
+  Object.keys(cache.cache).forEach((key) => {
+    if (key.startsWith(`${procedure}_`)) {
+      cache.delete(key);
+    }
+  });
+}
+
+// Export cache functions
+export { cacheResponse, invalidateCache };
